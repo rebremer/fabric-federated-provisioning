@@ -1,0 +1,28 @@
+# --- Secrets / environment-specific config (NEVER commit) ---
+# Real configs live next to *.example.yaml templates. Only the templates are tracked.
+config/*.yaml
+!config/*.example.yaml
+
+# Scratch / demo notes that often contain credentials.
+prompt.txt
+*.local.md
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

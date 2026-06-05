@@ -1,0 +1,28 @@
+Demo flow for scripts/provision_fabric.py
+
+Prerequisite (out-of-band, before running the script):
+  - security group <secgrp-name> granted "Storage Blob Data Contributor"
+    on the target ADLS Gen2 account.
+
+1. Admin creates the workspace and grants <secgrp-name>:
+     - Contributor on the workspace
+     - ConnectionCreator on OPDG-01 and virtualDG-01
+2. SPN (member of <secgrp-name>) creates the connections:
+     - SQL source connection on OPDG-01
+     - ShareableCloud ADLS Gen2 target connection (usable from gateways)
+3. SPN creates the Fabric copy pipeline (SQL -> ADLS Gen2 Parquet).
+4. SPN runs the pipeline.
+
+
+# --- Step 1: Fabric admin ---
+az login
+python scripts/provision_fabric.py 1 config/prod-01.yaml
+
+# --- Steps 2-4: SPN (member of <secgrp-name>) ---
+az logout
+# NEVER paste the real secret here. Use $env:SPN_SECRET, Get-Secret, or paste at the prompt only.
+az login --service-principal --username <SPN_APP_ID> --tenant <TENANT_ID> --password <SPN_SECRET> --allow-no-subscriptions
+
+python scripts/provision_fabric.py 2 config/prod-01.yaml   # connections
+python scripts/provision_fabric.py 3 config/prod-01.yaml   # pipeline
+python scripts/provision_fabric.py 4 config/prod-01.yaml   # run + poll
