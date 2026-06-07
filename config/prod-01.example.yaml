@@ -4,40 +4,66 @@
 
 workspace:
   name: <workspace-display-name>
-  # Optional: Fabric capacity GUID to bind the new workspace to.
-  capacity_id: <fabric-capacity-guid>
-  # Optional: SPN *object id* (not app id) to assign directly as Contributor in step 2.3.
-  # Belt-and-braces alongside the group assignment in 2.2 — guarantees the SPN sees the
+  # Optional: SPN *object id* (not app id) to assign directly as Contributor in step 3.3.
+  # Belt-and-braces alongside the group assignment in 3.2 — guarantees the SPN sees the
   # workspace even when AAD group propagation to Fabric is slow or unreliable.
   # Get with: az ad sp show --id <app-id> --query id -o tsv
   # spn_object_id: <spn-object-id>
 
+capacity:
+  # ARM coordinates for the Fabric capacity created by step 2 (Platform SPN).
+  # The Platform SPN must have Contributor (or Microsoft.Fabric/capacities/write) on the RG.
+  # Step 2 self-assigns capacity Admin via properties.administration.members — no manual
+  # Fabric Admin portal step required (the per-capacity Contributors allow-list has no
+  # public REST API; this side-steps it by making the SPN a capacity Admin via ARM).
+  # Capacity name constraints: ^[a-z][a-z0-9]*$ (lowercase letters/digits, starts with letter),
+  # 3-63 chars, globally unique across all Azure tenants.
+  subscription_id: <azure-subscription-guid>
+  resource_group: <azure-resource-group-name>
+  name: <capacity-name>            # e.g. fabriccapprod01 (lowercase, ^[a-z][a-z0-9]*$)
+  location: <azure-region>         # e.g. westeurope, westus3
+  sku: F2                          # F2-F2048; F2 ≈ $263/mo always-on (cheapest Fabric tier)
+  # Optional cache: auto-discovered & persisted to <cfg>.state.yaml by step 2.
+  # id: <fabric-capacity-guid>
+
 security_group:
   # *Team* security group: Entra ID object id of the group containing the team SPN.
-  # Step 2 grants this group Contributor on the workspace; step 3 grants it
-  # ConnectionCreator on both gateways. The team SPN runs steps 4-6 by virtue
+  # Step 3 grants this group Contributor on the workspace; step 4 grants it
+  # ConnectionCreatorWithResharing on both gateways. The team SPN runs steps 5-7 by virtue
   # of being in this group.
   object_id: <team-security-group-object-id>
 
 platform_workspace_security_group:
   # *Platform workspace-creator* security group. Members can create Fabric workspaces.
   # Gated by the Fabric tenant setting "Service principals can create workspaces,
-  # connections, and deployment pipelines" — add this group to its allow-list in
-  # the Admin portal (one-time, manual; no REST API for tenant settings writes).
-  # The Platform SPN must be a member of this group to run step 2.
-  # Not referenced by the script at runtime; documented here for clarity.
+  # connections, and deployment pipelines" — step 1.3 adds this group to that allow-list
+  # via the tenant-settings Preview REST API. The setting name(s) live under
+  # `tenant_settings.enabled_setting_names` below.
+  # The Platform SPN must be a member of this group to run step 3.
   object_id: <platform-workspace-security-group-object-id>
 
 platform_gateway_security_group:
   # *Platform gateway-admin* security group. Step 1 (Fabric admin) grants this group
   # Admin on the OPDG and VDG so its members (e.g. the Platform SPN) can later
-  # delegate ConnectionCreator to team secgrps without involving the Fabric admin.
-  # The Platform SPN must be a member of this group to run step 3.
+  # delegate ConnectionCreatorWithResharing to team secgrps without involving the
+  # Fabric admin. (Docs say ConnectionCreatorWithResharing is enough to assign roles
+  # but in practice only Admin works — lower roles get 403 InsufficientPermissionsToManageGateway.)
+  # The Platform SPN must be a member of this group to run step 4.
   object_id: <platform-gateway-security-group-object-id>
+
+# REQUIRED. Tenant settings to enable for platform_workspace_security_group in step 1.3.
+# This is what makes the platform workspace-creator secgrp able to create workspaces.
+# Step 1 hard-fails when this list is empty.
+# Requires the Fabric admin running step 1 to have Tenant.ReadWrite.All (Preview API).
+# Discover the exact setting name(s) for your tenant with:
+#   python scripts/provision_fabric.py tenant-settings config/<env>.yaml
+tenant_settings:
+  enabled_setting_names:
+    - <e.g. CreateWorkspaces>
 
 # Azure Key Vault holding (a) the SQL password used by the OPDG source connection
 # and (b) the SP secret used by the ADLS target connection.
-# The Team SPN running step 4 needs 'Key Vault Secrets User' on this vault.
+# The Team SPN running step 5 needs 'Key Vault Secrets User' on this vault.
 key_vault:
   vault_url: https://<your-kv-name>.vault.azure.net
   sql_password_secret_name: <kv-secret-name-for-sql-password>
@@ -62,7 +88,7 @@ connections:
   target:
     # ADLS Gen2 target. Created as a ShareableCloud connection with
     # allowConnectionUsageInGateway=true so the OPDG can use it for the sink leg.
-    # Authenticated as the SPN; secret pulled from KV at step 4 runtime.
+    # Authenticated as the SPN; secret pulled from KV at step 5 runtime.
     name: <target-connection-display-name>
     adls_account: <adls-account-name>
     container: <container-name>

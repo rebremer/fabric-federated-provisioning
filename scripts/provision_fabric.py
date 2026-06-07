@@ -1,46 +1,55 @@
 """
 Provision a Microsoft Fabric workspace end-to-end for a customer demo.
 
-Three personas, federated by design, six steps:
+Three personas, federated by design, seven steps:
 
     # --- Step 1: Fabric admin (interactive, one-time bootstrap) ---
     # Grants the *platform gateway-admin* security group Admin on the OPDG and VDG
-    # so its members (e.g. the Platform SPN) can later delegate ConnectionCreator
+    # so its members (e.g. the Platform SPN) can later delegate ConnectionCreatorWithResharing
     # to team security groups without involving the Fabric admin again.
     az login
     python scripts/provision_fabric.py 1 config/prod-01.yaml
 
-    # --- Steps 2-3: Platform SPN (member of both platform security groups) ---
-    # Step 2: create the workspace and grant the team security group (+ team SPN)
+    # --- Steps 2-4: Platform SPN (member of both platform security groups) ---
+    # Step 2: ARM-create a Microsoft.Fabric/capacities F2 capacity in the RG the Platform
+    #         SPN has Contributor on, and self-assign capacity Admin (so step 3 can bind
+    #         the workspace without any Fabric Admin portal step).
+    # Step 3: create the workspace and grant the team security group (+ team SPN)
     #         Contributor on the workspace.
-    # Step 3: federate gateway access — grant the team security group
-    #         ConnectionCreator on the OPDG and VDG.
+    # Step 4: federate gateway access — grant the team security group
+    #         ConnectionCreatorWithResharing on the OPDG and VDG.
     az logout
     az login --service-principal --username <platform-app-id> --tenant <tenant-id> --password <secret>
     python scripts/provision_fabric.py 2 config/prod-01.yaml
     python scripts/provision_fabric.py 3 config/prod-01.yaml
+    python scripts/provision_fabric.py 4 config/prod-01.yaml
 
-    # --- Steps 4-6: Team SPN (member of the team security group) ---
+    # --- Steps 5-7: Team SPN (member of the team security group) ---
     az logout
     az login --service-principal --username <team-app-id> --tenant <tenant-id> --password <secret>
 
-    python scripts/provision_fabric.py 4 config/prod-01.yaml   # SQL source + ADLS target connections
-    python scripts/provision_fabric.py 5 config/prod-01.yaml   # create/update the copy pipeline
-    python scripts/provision_fabric.py 6 config/prod-01.yaml   # run the pipeline (polls)
+    python scripts/provision_fabric.py 5 config/prod-01.yaml   # SQL source + ADLS target connections
+    python scripts/provision_fabric.py 6 config/prod-01.yaml   # create/update the copy pipeline
+    python scripts/provision_fabric.py 7 config/prod-01.yaml   # run the pipeline (polls)
 
 Convenience:
-    python scripts/provision_fabric.py all    config/prod-01.yaml  # run 1 -> 6 (single identity)
-    python scripts/provision_fabric.py status config/prod-01.yaml  # show current state
+    python scripts/provision_fabric.py all             config/prod-01.yaml  # run 1 -> 7 (single identity)
+    python scripts/provision_fabric.py status          config/prod-01.yaml  # show current state
+    python scripts/provision_fabric.py tenant-settings config/prod-01.yaml  # list tenant settings (Fabric admin)
 
 Every step is idempotent: re-running checks for the existing object first.
+Step 5 also auto-retries POST /connections on transient upstream errors
+(e.g. Azure SQL serverless DB resuming, gateway DataSourceAccessError) with
+exponential backoff before bailing out.
 
 Assumptions: SQL source (e.g. Azure SQL / AdventureWorksLT), target ADLS Gen2, OPDG,
 virtual DG, *two* platform security groups (workspace-creator + gateway-admin) and a
 team security group, platform + team SPNs, and a Key Vault holding the SQL password
-and team SPN secret already exist. Manual Fabric Admin portal prereqs (no public REST):
-the platform workspace-creator secgrp must be (a) on the tenant allow-list for
-"Service principals can create workspaces" and (b) a Contributor on the target
-Fabric capacity — otherwise step 2.1 fails 401/403 or InsufficientPermissionsOverCapacity.
+and team SPN secret already exist. The Platform SPN must have Contributor (or
+`Microsoft.Fabric/capacities/write`) on the Azure RG named in `capacity.resource_group`
+so step 2 can create the Fabric capacity. The "Service principals can create workspaces"
+tenant allow-list is managed by step 1.3 via the Fabric tenant-settings Preview REST API
+(mandatory, configured in YAML).
 Auth: `az login` (DefaultAzureCredential).
 """
 
@@ -67,6 +76,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 FABRIC_BASE = "https://api.fabric.microsoft.com/v1"
 FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default"
+ARM_BASE = "https://management.azure.com"
+ARM_SCOPE = "https://management.azure.com/.default"
 
 
 # ---------------------------------------------------------------------------
@@ -138,15 +149,54 @@ class FabricClient:
         )
 
 
+class ArmClient:
+    """Thin Azure Resource Manager client. Same auth pattern as FabricClient but ARM scope."""
+
+    def __init__(self) -> None:
+        self._cred = DefaultAzureCredential()
+        self._token: str | None = None
+        self._token_expires_at: float = 0.0
+
+    def _headers(self) -> dict[str, str]:
+        if not self._token or time.time() > self._token_expires_at - 300:
+            tok = self._cred.get_token(ARM_SCOPE)
+            self._token = tok.token
+            self._token_expires_at = tok.expires_on
+        return {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json",
+        }
+
+    def request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        url = path if path.startswith("http") else f"{ARM_BASE}{path}"
+        return requests.request(method, url, headers=self._headers(), timeout=120, **kwargs)
+
+    def whoami_oid(self) -> str:
+        """Return the object id of the currently authenticated principal (from JWT 'oid' claim)."""
+        self._headers()  # ensure token
+        assert self._token is not None
+        try:
+            payload_b64 = self._token.split(".")[1]
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception as e:  # pragma: no cover
+            raise SystemExit(f"Failed to decode ARM token claims: {e}")
+        oid = claims.get("oid")
+        if not oid:
+            raise SystemExit("ARM token has no 'oid' claim; cannot self-assign capacity admin")
+        return oid
+
+
 def step_log(step: str, msg: str) -> None:
     print(f"[{step}] {msg}", flush=True)
 
 
 # ---------------------------------------------------------------------------
-# Sidecar state file: persists ids discovered by step 2 (workspace id) so that
-# steps 3-5 running as the Team SPN do not depend on `GET /v1/workspaces`,
-# which is unreliable for SPNs that only have access via a security group. The
-# state file lives next to the YAML as `<cfg>.state.yaml` and is git-ignored.
+# Sidecar state file: persists ids discovered by step 2 (capacity GUID) and
+# step 3 (workspace id) so that later steps running as the Team SPN do not
+# depend on `GET /v1/workspaces` or `GET /v1/capacities`, which are unreliable
+# for SPNs that only have access via a security group. The state file lives
+# next to the YAML as `<cfg>.state.yaml` and is git-ignored.
 # ---------------------------------------------------------------------------
 
 
@@ -163,6 +213,10 @@ def _load_state_into_cfg(cfg: dict[str, Any], cfg_path: Path) -> None:
     if ws_id and not cfg.get("workspace", {}).get("id"):
         cfg.setdefault("workspace", {})["id"] = ws_id
         step_log("init", f"loaded workspace.id={ws_id} from {sp.name}")
+    cap_id = (state.get("capacity") or {}).get("id")
+    if cap_id and not cfg.get("capacity", {}).get("id"):
+        cfg.setdefault("capacity", {})["id"] = cap_id
+        step_log("init", f"loaded capacity.id={cap_id} from {sp.name}")
 
 
 def _save_workspace_id(cfg: dict[str, Any], workspace_id: str) -> None:
@@ -174,7 +228,19 @@ def _save_workspace_id(cfg: dict[str, Any], workspace_id: str) -> None:
     state = state or {}
     state.setdefault("workspace", {})["id"] = workspace_id
     sp.write_text(yaml.safe_dump(state, sort_keys=False))
-    step_log("2.1", f"persisted workspace.id={workspace_id} to {sp.name}")
+    step_log("3.1", f"persisted workspace.id={workspace_id} to {sp.name}")
+
+
+def _save_capacity_id(cfg: dict[str, Any], capacity_id: str) -> None:
+    cfg_path = cfg.get("_cfg_path")
+    if not cfg_path:
+        return
+    sp = _state_path(cfg_path)
+    state = yaml.safe_load(sp.read_text()) if sp.exists() else {}
+    state = state or {}
+    state.setdefault("capacity", {})["id"] = capacity_id
+    sp.write_text(yaml.safe_dump(state, sort_keys=False))
+    step_log("2", f"persisted capacity.id={capacity_id} to {sp.name}")
 
 
 def require_identity(client: FabricClient, step: str, role: str) -> None:
@@ -218,14 +284,14 @@ def find_pipeline(client: FabricClient, workspace_id: str, name: str) -> dict[st
 def require_workspace(client: FabricClient, cfg: dict[str, Any], step: str) -> dict[str, Any]:
     ws = find_workspace(client, cfg["workspace"]["name"], cfg["workspace"].get("id"))
     if not ws:
-        raise SystemExit(f"[{step}] Workspace '{cfg['workspace']['name']}' not found. Run step 2.1 first.")
+        raise SystemExit(f"[{step}] Workspace '{cfg['workspace']['name']}' not found. Run step 3.1 first.")
     return ws
 
 
 def require_connection(client: FabricClient, name: str, step: str) -> dict[str, Any]:
     conn = find_connection(client, name)
     if not conn:
-        raise SystemExit(f"[{step}] Connection '{name}' not found. Run the matching step 4 first.")
+        raise SystemExit(f"[{step}] Connection '{name}' not found. Run the matching step 5 first.")
     return conn
 
 
@@ -272,11 +338,33 @@ def _assign_gateway_role(
     principal_type: str = "Group",
     role: str = "ConnectionCreator",
 ) -> None:
-    """Idempotently assign a principal a role on the OPDG (which='opdg') or VDG (which='vdg')."""
+    """Idempotently assign a principal a role on the OPDG (which='opdg') or VDG (which='vdg').
+
+    - If the principal already has the requested role, no-op.
+    - If the principal has a *different* role, PATCH the assignment to the new role.
+    - Otherwise POST a new assignment.
+    """
     gid_gw = resolve_gateway_id(client, cfg, which, step)
     assignments = client.get_paged(f"/gateways/{gid_gw}/roleAssignments")
-    if any(a.get("principal", {}).get("id") == principal_id and a.get("role") == role for a in assignments):
-        step_log(step, f"{principal_type} {principal_id} already has role '{role}' on gateway {gid_gw}")
+    existing = next(
+        (a for a in assignments if a.get("principal", {}).get("id") == principal_id),
+        None,
+    )
+    if existing is not None:
+        if existing.get("role") == role:
+            step_log(step, f"{principal_type} {principal_id} already has role '{role}' on gateway {gid_gw}")
+            return
+        ra_id = existing.get("id") or principal_id  # role-assignment id == principal id in Fabric
+        client.request(
+            "PATCH",
+            f"/gateways/{gid_gw}/roleAssignments/{ra_id}",
+            json={"role": role},
+        )
+        step_log(
+            step,
+            f"Updated {principal_type} {principal_id} on gateway {gid_gw}: "
+            f"'{existing.get('role')}' -> '{role}'",
+        )
         return
     client.post(
         f"/gateways/{gid_gw}/roleAssignments",
@@ -296,8 +384,16 @@ def _require_platform_gateway_group_id(cfg: dict[str, Any], step: str) -> str:
 
 # --- Step 1: Fabric admin (one-time bootstrap) -----------------------------
 # Grants the platform *gateway-admin* security group Admin on the OPDG and VDG so its
-# members (the Platform SPN) can later assign ConnectionCreator to team groups
-# without involving the Fabric admin again.
+# members (the Platform SPN) can later assign ConnectionCreatorWithResharing to team
+# groups without involving the Fabric admin again. Note: the docs say
+# ConnectionCreatorWithResharing is sufficient to call POST /v1/gateways/{id}/roleAssignments,
+# but in practice that returns 403 InsufficientPermissionsToManageGateway — only Admin
+# works. Step 1.3 also adds the platform *workspace-creator* group to the tenant-setting
+# allow-lists named in YAML.
+#
+# Capacity Contributors is no longer a manual prereq: step 2 (Platform SPN) creates a
+# Microsoft.Fabric/capacities resource via ARM and self-assigns capacity Admin, which
+# is a superset of Contributor and unlocks workspace-to-capacity binding.
 
 
 def step_1_1(client: FabricClient, cfg: dict[str, Any]) -> None:
@@ -316,48 +412,231 @@ def step_1_2(client: FabricClient, cfg: dict[str, Any]) -> None:
     )
 
 
-# --- Step 2: Platform SPN — workspace lifecycle --------------------------
-# Creates the workspace and grants the team security group + team SPN
-# Contributor on the workspace.
+def step_1_3(client: FabricClient, cfg: dict[str, Any]) -> None:
+    """Add platform_workspace_security_group to the configured tenant-setting allow-lists.
+
+    Mandatory: hard-fails when `tenant_settings.enabled_setting_names` is missing or
+    empty. This is what makes the *platform workspace-creator* secgrp actually able
+    to create workspaces under "Service principals can create workspaces, connections,
+    and deployment pipelines". Idempotent: no-op when the group is already present.
+
+    Requires the Fabric admin running this step to have `Tenant.ReadWrite.All`
+    (Fabric tenant-settings update API is in Preview at time of writing).
+    """
+    ts = cfg.get("tenant_settings") or {}
+    names: list[str] = ts.get("enabled_setting_names") or []
+    if not names:
+        raise SystemExit(
+            "[1.3] tenant_settings.enabled_setting_names is required and must list at least "
+            "one Fabric tenant setting (e.g. the one gating SPN workspace creation). "
+            "Discover names with: python scripts/provision_fabric.py tenant-settings <config>"
+        )
+    pgrp = cfg.get("platform_workspace_security_group") or {}
+    graph_id = pgrp.get("object_id")
+    if not graph_id:
+        raise SystemExit(
+            "[1.3] platform_workspace_security_group.object_id is required when "
+            "tenant_settings.enabled_setting_names is set"
+        )
+    display_name = pgrp.get("name")  # optional; Fabric resolves it server-side if omitted
+    try:
+        settings = client.get_paged("/admin/tenantsettings")
+    except RuntimeError as e:
+        raise SystemExit(
+            f"[1.3] GET /v1/admin/tenantsettings failed: {e}. "
+            "Caller must be a Fabric administrator with Tenant.Read.All or Tenant.ReadWrite.All."
+        )
+    by_name = {s.get("settingName"): s for s in settings}
+    for setting_name in names:
+        existing = by_name.get(setting_name)
+        if existing is None:
+            sample = ", ".join(sorted(by_name)[:10])
+            raise SystemExit(
+                f"[1.3] tenant setting '{setting_name}' not found in this tenant. "
+                f"First 10 available: {sample}. Run "
+                f"`python scripts/provision_fabric.py tenant-settings <config>` to list all."
+            )
+        groups = list(existing.get("enabledSecurityGroups") or [])
+        if any(g.get("graphId") == graph_id for g in groups):
+            step_log("1.3", f"'{setting_name}': group already in enabledSecurityGroups (no-op)")
+            continue
+        new_group: dict[str, Any] = {"graphId": graph_id}
+        if display_name:
+            new_group["name"] = display_name
+        groups.append(new_group)
+        body: dict[str, Any] = {
+            "enabled": True,
+            "enabledSecurityGroups": groups,
+        }
+        # Preserve other fields so this update doesn't inadvertently clear them.
+        if existing.get("excludedSecurityGroups"):
+            body["excludedSecurityGroups"] = existing["excludedSecurityGroups"]
+        if existing.get("properties"):
+            body["properties"] = existing["properties"]
+        for k in ("delegateToCapacity", "delegateToDomain", "delegateToWorkspace"):
+            if k in existing:
+                body[k] = existing[k]
+        client.post(f"/admin/tenantsettings/{setting_name}/update", body)
+        step_log(
+            "1.3",
+            f"'{setting_name}': added '{display_name}' ({graph_id}) to enabledSecurityGroups",
+        )
 
 
-def step_2_1(client: FabricClient, cfg: dict[str, Any]) -> dict[str, Any]:
+# --- Step 2: Platform SPN — create the Fabric capacity (ARM) -------------
+# Idempotent PUT of Microsoft.Fabric/capacities/{name}. The Platform SPN
+# self-assigns capacity Admin via properties.administration.members, which is a
+# superset of "Contributor" and unlocks workspace-to-capacity binding in step 3
+# without any manual Fabric Admin portal step. Requires the Platform SPN to have
+# `Microsoft.Fabric/capacities/write` (e.g. Contributor) on the target RG.
+#
+# Persists the discovered Fabric capacity GUID to <cfg>.state.yaml so step 3 can
+# reuse it (and so re-runs don't depend on Fabric returning the capacity in
+# GET /v1/capacities before the YAML is updated).
+
+
+def step_2(client: FabricClient, cfg: dict[str, Any]) -> None:
+    cap = cfg.get("capacity") or {}
+    for k in ("subscription_id", "resource_group", "name", "location"):
+        if not cap.get(k):
+            raise SystemExit(
+                f"[2] capacity.{k} is required (see config/<env>.example.yaml for the schema)"
+            )
+    sub = cap["subscription_id"]
+    rg = cap["resource_group"]
+    name = cap["name"]
+    location = cap["location"]
+    sku = cap.get("sku") or "F2"
+
+    arm = ArmClient()
+    self_oid = arm.whoami_oid()
+    path = (
+        f"/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Fabric/capacities/"
+        f"{name}?api-version=2023-11-01"
+    )
+    rg_scope = f"/subscriptions/{sub}/resourceGroups/{rg}"
+
+    def _fail_403(action: str, resp: requests.Response) -> None:
+        raise SystemExit(
+            f"[2] {action} got 403 \u2014 the current identity ({self_oid}) is missing\n"
+            f"     Microsoft.Fabric/capacities/write (or Contributor) on RG '{rg}'.\n"
+            f"     Grant it once with (run as a subscription Owner / User Access Administrator):\n"
+            f"\n"
+            f"       az role assignment create \\\n"
+            f"         --assignee-object-id {self_oid} --assignee-principal-type ServicePrincipal \\\n"
+            f"         --role Contributor \\\n"
+            f"         --scope {rg_scope}\n"
+            f"\n"
+            f"     Full ARM response: {resp.status_code} {resp.text}"
+        )
+
+    get_resp = arm.request("GET", path)
+    if get_resp.status_code == 403:
+        _fail_403("GET capacity", get_resp)
+    if get_resp.status_code == 200:
+        existing = get_resp.json()
+        members = (((existing.get("properties") or {}).get("administration")) or {}).get("members") or []
+        step_log("2", f"Capacity '{name}' already exists in RG '{rg}' (sku={(existing.get('sku') or {}).get('name', '?')})")
+        if self_oid not in members:
+            patch_body = {"properties": {"administration": {"members": sorted({*members, self_oid})}}}
+            r = arm.request("PATCH", path, json=patch_body)
+            if r.status_code == 403:
+                _fail_403("PATCH capacity admins", r)
+            if not r.ok:
+                raise SystemExit(f"[2] PATCH capacity admins failed {r.status_code}: {r.text}")
+            step_log("2", f"Added self ({self_oid}) to capacity administration.members")
+        else:
+            step_log("2", f"Self ({self_oid}) already in capacity administration.members (no-op)")
+    elif get_resp.status_code == 404:
+        body = {
+            "location": location,
+            "sku": {"name": sku, "tier": "Fabric"},
+            "properties": {"administration": {"members": [self_oid]}},
+        }
+        r = arm.request("PUT", path, json=body)
+        if r.status_code == 403:
+            _fail_403("PUT capacity", r)
+        if r.status_code not in (200, 201, 202):
+            raise SystemExit(f"[2] PUT capacity failed {r.status_code}: {r.text}")
+        step_log("2", f"Submitted capacity create '{name}' (sku={sku}, location={location})")
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            time.sleep(10)
+            r2 = arm.request("GET", path)
+            if r2.status_code != 200:
+                step_log("2", f"  GET returned {r2.status_code}; retrying")
+                continue
+            state = ((r2.json().get("properties") or {}).get("provisioningState"))
+            step_log("2", f"  provisioningState={state}")
+            if state == "Succeeded":
+                break
+            if state in ("Failed", "Canceled"):
+                raise SystemExit(f"[2] capacity provisioning ended in state '{state}': {r2.text}")
+        else:
+            raise SystemExit("[2] capacity provisioning did not complete within 600s")
+    else:
+        raise SystemExit(f"[2] GET capacity failed {get_resp.status_code}: {get_resp.text}")
+
+    # Resolve the Fabric capacity GUID (the workspace assign API wants this, not the ARM name).
+    capacities = client.get_paged("/capacities")
+    match = next((c for c in capacities if c.get("displayName") == name), None)
+    if not match:
+        raise SystemExit(
+            f"[2] capacity '{name}' was created/found via ARM but is not yet visible to "
+            f"the current identity via Fabric GET /v1/capacities. Wait ~30s and re-run step 2."
+        )
+    cap_id = match["id"]
+    cfg["capacity"]["id"] = cap_id
+    _save_capacity_id(cfg, cap_id)
+    step_log("2", f"Fabric capacity GUID = {cap_id}")
+
+
+# --- Step 3: Platform SPN — workspace lifecycle --------------------------
+# Creates the workspace (bound to the capacity created in step 2) and grants the
+# team security group + team SPN Contributor on the workspace.
+
+
+def step_3_1(client: FabricClient, cfg: dict[str, Any]) -> dict[str, Any]:
     name = cfg["workspace"]["name"]
     existing = find_workspace(client, name, cfg["workspace"].get("id"))
     if existing:
-        step_log("2.1", f"Workspace '{name}' already exists (id={existing['id']})")
+        step_log("3.1", f"Workspace '{name}' already exists (id={existing['id']})")
         cfg["workspace"]["id"] = existing["id"]
         _save_workspace_id(cfg, existing["id"])
         return existing
-    body: dict[str, Any] = {"displayName": name}
-    if cfg["workspace"].get("capacity_id"):
-        body["capacityId"] = cfg["workspace"]["capacity_id"]
+    cap_id = (cfg.get("capacity") or {}).get("id")
+    if not cap_id:
+        raise SystemExit(
+            "[3.1] capacity.id missing in config + state file. Run step 2 first to create the "
+            "Fabric capacity (it persists the GUID to <cfg>.state.yaml)."
+        )
+    body: dict[str, Any] = {"displayName": name, "capacityId": cap_id}
     ws = client.post("/workspaces", body)
-    step_log("2.1", f"Created workspace '{name}' (id={ws['id']})")
+    step_log("3.1", f"Created workspace '{name}' (id={ws['id']})")
     cfg["workspace"]["id"] = ws["id"]
     _save_workspace_id(cfg, ws["id"])
     return ws
 
 
-def step_2_2(client: FabricClient, cfg: dict[str, Any]) -> None:
-    ws = require_workspace(client, cfg, "2.2")
+def step_3_2(client: FabricClient, cfg: dict[str, Any]) -> None:
+    ws = require_workspace(client, cfg, "3.2")
     gid = cfg["security_group"]["object_id"]
     role = "Contributor"
     assignments = client.get_paged(f"/workspaces/{ws['id']}/roleAssignments")
     if any(a.get("principal", {}).get("id") == gid and a.get("role") == role for a in assignments):
-        step_log("2.2", f"Group {gid} already has role '{role}' on workspace")
+        step_log("3.2", f"Group {gid} already has role '{role}' on workspace")
         return
     client.post(
         f"/workspaces/{ws['id']}/roleAssignments",
         {"principal": {"id": gid, "type": "Group"}, "role": role},
     )
-    step_log("2.2", f"Assigned group {gid} as {role} on workspace '{ws['displayName']}'")
+    step_log("3.2", f"Assigned group {gid} as {role} on workspace '{ws['displayName']}'")
 
 
-def step_2_3(client: FabricClient, cfg: dict[str, Any]) -> None:
+def step_3_3(client: FabricClient, cfg: dict[str, Any]) -> None:
     """Assign the team SPN directly as Contributor on the workspace.
 
-    Belt-and-braces alongside the group assignment in 2.2: group membership in Fabric
+    Belt-and-braces alongside the group assignment in 3.2: group membership in Fabric
     can be unreliable (propagation delays, AAD/Fabric sync edge cases), and a direct
     role assignment guarantees the SPN sees the workspace via GET /v1/workspaces/{id}.
     Skipped silently if workspace.spn_object_id is not set in YAML.
@@ -365,37 +644,41 @@ def step_2_3(client: FabricClient, cfg: dict[str, Any]) -> None:
     ws_cfg = cfg.get("workspace", {})
     oid = ws_cfg.get("spn_object_id")
     if not oid:
-        step_log("2.3", "workspace.spn_object_id not set; skipping direct SPN assignment")
+        step_log("3.3", "workspace.spn_object_id not set; skipping direct SPN assignment")
         return
-    ws = require_workspace(client, cfg, "2.3")
+    ws = require_workspace(client, cfg, "3.3")
     role = "Contributor"
     assignments = client.get_paged(f"/workspaces/{ws['id']}/roleAssignments")
     if any(a.get("principal", {}).get("id") == oid and a.get("role") == role for a in assignments):
-        step_log("2.3", f"SPN {oid} already has role '{role}' on workspace")
+        step_log("3.3", f"SPN {oid} already has role '{role}' on workspace")
         return
     client.post(
         f"/workspaces/{ws['id']}/roleAssignments",
         {"principal": {"id": oid, "type": "ServicePrincipal"}, "role": role},
     )
-    step_log("2.3", f"Assigned SPN {oid} as {role} on workspace '{ws['displayName']}'")
+    step_log("3.3", f"Assigned SPN {oid} as {role} on workspace '{ws['displayName']}'")
 
 
-# --- Step 3: Platform SPN — gateway federation --------------------------
-# Grants the team security group ConnectionCreator on the OPDG and VDG so
-# the Team SPN can create connections in step 4.
+# --- Step 4: Platform SPN — gateway federation --------------------------
+# Grants the team security group ConnectionCreatorWithResharing on the OPDG and VDG
+# so the Team SPN can create connections in step 5 *and* reshare them with other
+# principals. The platform gateway-admin secgrp (Admin role from step 1) is allowed
+# to assign any role, including ConnectionCreatorWithResharing.
 
 
-def step_3_1(client: FabricClient, cfg: dict[str, Any]) -> None:
+def step_4_1(client: FabricClient, cfg: dict[str, Any]) -> None:
     _assign_gateway_role(
-        client, cfg, "opdg", "3.1",
+        client, cfg, "opdg", "4.1",
         principal_id=cfg["security_group"]["object_id"],
+        role="ConnectionCreatorWithResharing",
     )
 
 
-def step_3_2(client: FabricClient, cfg: dict[str, Any]) -> None:
+def step_4_2(client: FabricClient, cfg: dict[str, Any]) -> None:
     _assign_gateway_role(
-        client, cfg, "vdg", "3.2",
+        client, cfg, "vdg", "4.2",
         principal_id=cfg["security_group"]["object_id"],
+        role="ConnectionCreatorWithResharing",
     )
 
 
@@ -626,10 +909,59 @@ def _create_connection(
         body["gatewayId"] = gateway_id
     if connectivity_type == "ShareableCloud" and allow_connection_usage_in_gateway:
         body["allowConnectionUsageInGateway"] = True
-    conn = client.post("/connections", body)
+    conn = _post_connection_with_retry(client, name, body, step)
     step_log(step, f"Created connection '{name}' (type={connectivity_type}, credential={credentials['credentialType']}, id={conn.get('id')})")
     _assign_connection_group_owner(client, cfg, conn["id"], step)
     return conn
+
+
+# Transient signatures returned by Fabric when the upstream data source is
+# momentarily unavailable. Re-running the script always succeeds, so we retry
+# in-process instead of bailing. Examples:
+#  - Azure SQL 40613 (paused serverless DB resuming, transient failover)
+#  - Generic OPDG "DataSourceAccessError" wrapping a connect timeout
+# Fabric returns `isRetriable: false` on these even though they are; we treat
+# the inner error code as the source of truth.
+_CONNECTION_RETRY_SIGNATURES = (
+    "DM_GWPipeline_Gateway_DataSourceAccessError",
+    "is not currently available",
+    "40613",
+    "CreateGatewayConnectionFailed",
+)
+
+
+def _post_connection_with_retry(
+    client: FabricClient, name: str, body: dict[str, Any], step: str,
+    *, attempts: int = 4, backoff_s: tuple[int, ...] = (10, 30, 60),
+) -> dict[str, Any]:
+    """POST /connections with retry on transient upstream-data-source errors.
+
+    Between attempts, re-checks GET /connections in case Fabric created the
+    connection server-side despite returning a 4xx.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        # Defensive: if a prior attempt actually created the connection, pick it up.
+        if attempt > 1:
+            existing = find_connection(client, name)
+            if existing:
+                step_log(step, f"  retry detected connection '{name}' exists (id={existing['id']}); using it")
+                return existing
+        try:
+            return client.post("/connections", body)
+        except RuntimeError as e:
+            msg = str(e)
+            is_transient = any(sig in msg for sig in _CONNECTION_RETRY_SIGNATURES)
+            if not is_transient or attempt == attempts:
+                raise
+            delay = backoff_s[min(attempt - 1, len(backoff_s) - 1)]
+            step_log(step, f"  transient error on POST /connections (attempt {attempt}/{attempts}); retrying in {delay}s")
+            step_log(step, f"  underlying: {msg.splitlines()[0][:300]}")
+            last_err = e
+            time.sleep(delay)
+    # Unreachable (loop either returns or raises), but appeases type-checkers.
+    assert last_err is not None
+    raise last_err
 
 
 def _assign_connection_group_owner(
@@ -655,24 +987,24 @@ def _assign_connection_group_owner(
     step_log(step, f"Granted group {gid} '{role}' on connection {connection_id}")
 
 
-def step_4_1(client: FabricClient, cfg: dict[str, Any]) -> dict[str, Any]:
+def step_5_1(client: FabricClient, cfg: dict[str, Any]) -> dict[str, Any]:
     return _create_connection(
         client, cfg, cfg["connections"]["source"],
-        resolve_gateway_id(client, cfg, "opdg", "4.1"),
-        "OnPremisesGateway", "4.1",
+        resolve_gateway_id(client, cfg, "opdg", "5.1"),
+        "OnPremisesGateway", "5.1",
     )
 
 
-def step_4_2(client: FabricClient, cfg: dict[str, Any]) -> dict[str, Any]:
+def step_5_2(client: FabricClient, cfg: dict[str, Any]) -> dict[str, Any]:
     # The VDG ADLS connector does not support WorkspaceIdentity (only Key/OAuth2/SAS/SP).
     # WorkspaceIdentity is supported only on ShareableCloud. We create a cloud connection
     # with allowConnectionUsageInGateway=true so it can be consumed by pipeline activities
     # that route through the OPDG/VDG that the workspace has access to. The VDG id is
     # resolved here only to validate the workspace can see it.
-    resolve_gateway_id(client, cfg, "vdg", "4.2")
+    resolve_gateway_id(client, cfg, "vdg", "5.2")
     return _create_connection(
         client, cfg, cfg["connections"]["target"],
-        None, "ShareableCloud", "4.2",
+        None, "ShareableCloud", "5.2",
         allow_connection_usage_in_gateway=True,
     )
 
@@ -727,10 +1059,10 @@ def build_pipeline_definition(
     return {"parts": [{"path": "pipeline-content.json", "payload": payload, "payloadType": "InlineBase64"}]}
 
 
-def step_5(client: FabricClient, cfg: dict[str, Any]) -> dict[str, Any]:
-    ws = require_workspace(client, cfg, "5")
-    src_conn = require_connection(client, cfg["connections"]["source"]["name"], "5")
-    tgt_conn = require_connection(client, cfg["connections"]["target"]["name"], "5")
+def step_6(client: FabricClient, cfg: dict[str, Any]) -> dict[str, Any]:
+    ws = require_workspace(client, cfg, "6")
+    src_conn = require_connection(client, cfg["connections"]["source"]["name"], "6")
+    tgt_conn = require_connection(client, cfg["connections"]["target"]["name"], "6")
     name = cfg["pipeline"]["name"]
     definition = build_pipeline_definition(
         src_conn["id"], cfg["pipeline"]["source_query"],
@@ -743,41 +1075,41 @@ def step_5(client: FabricClient, cfg: dict[str, Any]) -> dict[str, Any]:
             f"/workspaces/{ws['id']}/dataPipelines/{existing['id']}/updateDefinition",
             {"definition": definition},
         )
-        step_log("5", f"Updated pipeline '{name}' (id={existing['id']})")
+        step_log("6", f"Updated pipeline '{name}' (id={existing['id']})")
         return existing
     item = client.post(
         f"/workspaces/{ws['id']}/items",
         {"displayName": name, "type": "DataPipeline", "definition": definition},
     )
-    step_log("5", f"Created pipeline '{name}' (id={item.get('id')})")
+    step_log("6", f"Created pipeline '{name}' (id={item.get('id')})")
     return item
 
 
-def step_6(client: FabricClient, cfg: dict[str, Any], timeout: int) -> str:
-    ws = require_workspace(client, cfg, "6")
+def step_7(client: FabricClient, cfg: dict[str, Any], timeout: int) -> str:
+    ws = require_workspace(client, cfg, "7")
     pipeline = find_pipeline(client, ws["id"], cfg["pipeline"]["name"])
     if not pipeline:
-        raise SystemExit(f"[6] Pipeline '{cfg['pipeline']['name']}' not found. Run step 5 first.")
+        raise SystemExit(f"[7] Pipeline '{cfg['pipeline']['name']}' not found. Run step 6 first.")
     resp = client.request(
         "POST", f"/workspaces/{ws['id']}/items/{pipeline['id']}/jobs/instances?jobType=Pipeline"
     )
     location = resp.headers.get("Location")
     if not location:
         raise RuntimeError("Pipeline run did not return a Location header to poll")
-    step_log("6", f"Pipeline run triggered; polling {location}")
+    step_log("7", f"Pipeline run triggered; polling {location}")
     deadline = time.time() + timeout
     while time.time() < deadline:
         status_obj = client.get(location)
         status = status_obj.get("status", "Unknown")
-        step_log("6", f"  status={status}")
+        step_log("7", f"  status={status}")
         if status in {"Completed", "Failed", "Cancelled", "Deduped"}:
-            step_log("6", f"Pipeline final status: {status}")
+            step_log("7", f"Pipeline final status: {status}")
             if status != "Completed":
                 fr = status_obj.get("failureReason") or {}
                 if fr:
-                    step_log("6", f"  errorCode={fr.get('errorCode')}")
-                    step_log("6", f"  message={fr.get('message')}")
-                step_log("6", f"  full job instance: {json.dumps(status_obj, indent=2)}")
+                    step_log("7", f"  errorCode={fr.get('errorCode')}")
+                    step_log("7", f"  message={fr.get('message')}")
+                step_log("7", f"  full job instance: {json.dumps(status_obj, indent=2)}")
             return status
         time.sleep(10)
     raise TimeoutError(f"Pipeline did not finish within {timeout}s")
@@ -821,10 +1153,11 @@ def step_status(client: FabricClient, cfg: dict[str, Any]) -> None:
                 )
                 step_log("status", f"{label} Admin for platform gateway group: {'OK' if has else 'MISSING'}")
             has = any(
-                a.get("principal", {}).get("id") == team_gid and a.get("role") == "ConnectionCreator"
+                a.get("principal", {}).get("id") == team_gid
+                and a.get("role") in ("ConnectionCreator", "ConnectionCreatorWithResharing")
                 for a in assignments
             )
-            step_log("status", f"{label} ConnectionCreator for team group: {'OK' if has else 'MISSING'}")
+            step_log("status", f"{label} ConnectionCreator(WithResharing) for team group: {'OK' if has else 'MISSING'}")
         except RuntimeError as e:
             step_log("status", f"{label} role check failed: {e}")
     for which, key in (("source", "source"), ("target", "target")):
@@ -836,41 +1169,64 @@ def step_status(client: FabricClient, cfg: dict[str, Any]) -> None:
 
 
 def step_1(client: FabricClient, cfg: dict[str, Any]) -> None:
-    """Fabric admin bootstrap: grant platform gateway-admin secgrp Admin on OPDG + VDG."""
+    """Fabric admin bootstrap: gateway Admin grants + tenant-setting allow-list."""
     step_1_1(client, cfg)
     step_1_2(client, cfg)
-
-
-def step_2(client: FabricClient, cfg: dict[str, Any]) -> None:
-    """Platform SPN: create workspace and grant team secgrp + team SPN Contributor on it."""
-    step_2_1(client, cfg)
-    step_2_2(client, cfg)  # team secgrp -> workspace Contributor
-    step_2_3(client, cfg)  # team SPN direct Contributor (belt-and-braces, no-op if oid not set)
+    step_1_3(client, cfg)
 
 
 def step_3(client: FabricClient, cfg: dict[str, Any]) -> None:
-    """Platform SPN: federate gateway access — team secgrp ConnectionCreator on OPDG + VDG."""
+    """Platform SPN: create workspace and grant team secgrp + team SPN Contributor on it."""
     step_3_1(client, cfg)
-    step_3_2(client, cfg)
+    step_3_2(client, cfg)  # team secgrp -> workspace Contributor
+    step_3_3(client, cfg)  # team SPN direct Contributor (belt-and-braces, no-op if oid not set)
 
 
 def step_4(client: FabricClient, cfg: dict[str, Any]) -> None:
-    """Team SPN: create the SQL source + ADLS target connections."""
+    """Platform SPN: federate gateway access — team secgrp ConnectionCreatorWithResharing on OPDG + VDG."""
     step_4_1(client, cfg)
     step_4_2(client, cfg)
+
+
+def step_5(client: FabricClient, cfg: dict[str, Any]) -> None:
+    """Team SPN: create the SQL source + ADLS target connections."""
+    step_5_1(client, cfg)
+    step_5_2(client, cfg)
+
+
+def step_tenant_settings(client: FabricClient, cfg: dict[str, Any]) -> None:
+    """List all Fabric tenant settings so the admin can pick names for tenant_settings.enabled_setting_names.
+
+    Requires Fabric admin + Tenant.Read.All (Preview API).
+    """
+    settings = client.get_paged("/admin/tenantsettings")
+    step_log("tenant-settings", f"{len(settings)} setting(s) returned (sorted by settingName):")
+    for s in sorted(settings, key=lambda x: x.get("settingName", "")):
+        sn = s.get("settingName", "?")
+        enabled = "ON " if s.get("enabled") else "off"
+        groups = s.get("enabledSecurityGroups") or []
+        if not groups:
+            scope = "[entire org]" if s.get("enabled") else "[disabled]"
+        else:
+            names = ", ".join(g.get("name", "?") for g in groups)
+            scope = f"[{len(groups)} group(s): {names}]"
+        title = s.get("title", "")
+        print(f"  {enabled}  {sn:<55}  {scope:<60}  {title}")
 
 
 STEPS = {
     "1": lambda c, cfg, _: (require_identity(c, "1", "Fabric admin"), step_1(c, cfg)),
     "2": lambda c, cfg, _: (require_identity(c, "2", "Platform SPN"), step_2(c, cfg)),
     "3": lambda c, cfg, _: (require_identity(c, "3", "Platform SPN"), step_3(c, cfg)),
-    "4": lambda c, cfg, _: (require_identity(c, "4", "Team SPN"), step_4(c, cfg)),
+    "4": lambda c, cfg, _: (require_identity(c, "4", "Platform SPN"), step_4(c, cfg)),
     "5": lambda c, cfg, _: (require_identity(c, "5", "Team SPN"), step_5(c, cfg)),
-    "6": lambda c, cfg, args: (require_identity(c, "6", "Team SPN"), step_6(c, cfg, args.timeout)),
+    "6": lambda c, cfg, _: (require_identity(c, "6", "Team SPN"), step_6(c, cfg)),
+    "7": lambda c, cfg, args: (require_identity(c, "7", "Team SPN"), step_7(c, cfg, args.timeout)),
     "status": lambda c, cfg, _: step_status(c, cfg),
+    "tenant-settings": lambda c, cfg, _: step_tenant_settings(c, cfg),
 }
 
-ALL_ORDER = ["1", "2", "3", "4", "5", "6"]
+ALL_ORDER = ["1", "2", "3", "4", "5", "6", "7"]
 
 
 def main() -> int:
@@ -880,7 +1236,7 @@ def main() -> int:
     parser.add_argument("step", choices=[*STEPS.keys(), "all"], help="Step to run")
     parser.add_argument("config", type=Path, help="Path to environment YAML config")
     parser.add_argument(
-        "--timeout", type=int, default=900, help="Pipeline run polling timeout in seconds (step 6)"
+        "--timeout", type=int, default=900, help="Pipeline run polling timeout in seconds (step 7)"
     )
     args = parser.parse_args()
 
