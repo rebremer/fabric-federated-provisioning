@@ -1,28 +1,49 @@
-Demo flow for scripts/provision_fabric.py
+Demo flow for scripts/provision_fabric.py — three federated personas, six steps.
 
-Prerequisite (out-of-band, before running the script):
-  - security group <secgrp-name> granted "Storage Blob Data Contributor"
-    on the target ADLS Gen2 account.
+Personas:
+  - Fabric admin: tenant admin, manages OPDG + VDG. One-time bootstrap only.
+  - Platform SPN: member of both <platform-workspace-secgrp-name> and
+    <platform-gateway-secgrp-name>. Creates workspaces and federates access to
+    team security groups. Never touches source/target data.
+  - Team SPN: member of <team-secgrp-name>. Creates connections, pipelines, and
+    runs them inside its assigned workspace.
 
-1. Admin creates the workspace and grants <secgrp-name>:
-     - Contributor on the workspace
-     - ConnectionCreator on OPDG-01 and virtualDG-01
-2. SPN (member of <secgrp-name>) creates the connections:
-     - SQL source connection on OPDG-01
-     - ShareableCloud ADLS Gen2 target connection (usable from gateways)
-3. SPN creates the Fabric copy pipeline (SQL -> ADLS Gen2 Parquet).
-4. SPN runs the pipeline.
+Prerequisites (out-of-band, before running the script):
+  - Tenant setting "Service principals can create workspaces" allows <platform-workspace-secgrp-name>.
+  - <platform-workspace-secgrp-name> added as Contributor on Fabric capacity workspace.capacity_id
+    (Fabric Admin portal → Capacity settings → Contributors). Without this, step 2.1 fails
+    InsufficientPermissionsOverCapacity. Note: this is *not* Azure RBAC on the capacity resource.
+  - <team-secgrp-name> granted "Storage Blob Data Contributor" on the target ADLS Gen2 account.
+  - All three secgrps exist; SPNs are members of their respective groups.
+
+Steps:
+  1. Fabric admin grants <platform-gateway-secgrp-name> Admin on OPDG + VDG (one-time per gateway).
+  2. Platform SPN creates the workspace and grants on it:
+       - <team-secgrp-name> Contributor
+       - Team SPN direct Contributor (belt-and-braces for group propagation lag)
+  3. Platform SPN grants <team-secgrp-name> ConnectionCreator on OPDG + VDG.
+  4. Team SPN creates the SQL source connection (OPDG) + ShareableCloud ADLS Gen2 target.
+  5. Team SPN creates the Fabric copy pipeline (SQL -> ADLS Gen2 Parquet).
+  6. Team SPN runs the pipeline and polls until completion.
 
 
-# --- Step 1: Fabric admin ---
+# --- Step 1: Fabric admin (one-time) ---
+az logout
 az login
 python scripts/provision_fabric.py 1 config/prod-01.yaml
 
-# --- Steps 2-4: SPN (member of <secgrp-name>) ---
+# --- Steps 2-3: Platform SPN ---
 az logout
-# NEVER paste the real secret here. Use $env:SPN_SECRET, Get-Secret, or paste at the prompt only.
-az login --service-principal --username <SPN_APP_ID> --tenant <TENANT_ID> --password <SPN_SECRET> --allow-no-subscriptions
+# NEVER paste the real secret here. Use $env:PLATFORM_SPN_SECRET, Get-Secret, or paste at the prompt only.
+az login --service-principal --username <PLATFORM_SPN_APP_ID> --tenant <TENANT_ID> --password <PLATFORM_SPN_SECRET> --allow-no-subscriptions
+python scripts/provision_fabric.py 2 config/prod-01.yaml   # workspace + workspace RBAC
+python scripts/provision_fabric.py 3 config/prod-01.yaml   # gateway federation (skip if no OPDG/VDG)
 
-python scripts/provision_fabric.py 2 config/prod-01.yaml   # connections
-python scripts/provision_fabric.py 3 config/prod-01.yaml   # pipeline
-python scripts/provision_fabric.py 4 config/prod-01.yaml   # run + poll
+# --- Steps 4-6: Team SPN (member of <team-secgrp-name>) ---
+az logout
+# NEVER paste the real secret here. Use $env:TEAM_SPN_SECRET, Get-Secret, or paste at the prompt only.
+az login --service-principal --username <TEAM_SPN_APP_ID> --tenant <TENANT_ID> --password <TEAM_SPN_SECRET> --allow-no-subscriptions
+
+python scripts/provision_fabric.py 4 config/prod-01.yaml   # connections
+python scripts/provision_fabric.py 5 config/prod-01.yaml   # pipeline
+python scripts/provision_fabric.py 6 config/prod-01.yaml   # run + poll

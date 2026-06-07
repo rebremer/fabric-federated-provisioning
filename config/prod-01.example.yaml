@@ -6,15 +6,38 @@ workspace:
   name: <workspace-display-name>
   # Optional: Fabric capacity GUID to bind the new workspace to.
   capacity_id: <fabric-capacity-guid>
+  # Optional: SPN *object id* (not app id) to assign directly as Contributor in step 2.3.
+  # Belt-and-braces alongside the group assignment in 2.2 — guarantees the SPN sees the
+  # workspace even when AAD group propagation to Fabric is slow or unreliable.
+  # Get with: az ad sp show --id <app-id> --query id -o tsv
+  # spn_object_id: <spn-object-id>
 
 security_group:
-  # Entra ID object id of the security group that contains the SPN.
-  # Added as Contributor on the workspace (step 1) and ConnectionCreator on both gateways.
-  object_id: <security-group-object-id>
+  # *Team* security group: Entra ID object id of the group containing the team SPN.
+  # Step 2 grants this group Contributor on the workspace; step 3 grants it
+  # ConnectionCreator on both gateways. The team SPN runs steps 4-6 by virtue
+  # of being in this group.
+  object_id: <team-security-group-object-id>
+
+platform_workspace_security_group:
+  # *Platform workspace-creator* security group. Members can create Fabric workspaces.
+  # Gated by the Fabric tenant setting "Service principals can create workspaces,
+  # connections, and deployment pipelines" — add this group to its allow-list in
+  # the Admin portal (one-time, manual; no REST API for tenant settings writes).
+  # The Platform SPN must be a member of this group to run step 2.
+  # Not referenced by the script at runtime; documented here for clarity.
+  object_id: <platform-workspace-security-group-object-id>
+
+platform_gateway_security_group:
+  # *Platform gateway-admin* security group. Step 1 (Fabric admin) grants this group
+  # Admin on the OPDG and VDG so its members (e.g. the Platform SPN) can later
+  # delegate ConnectionCreator to team secgrps without involving the Fabric admin.
+  # The Platform SPN must be a member of this group to run step 3.
+  object_id: <platform-gateway-security-group-object-id>
 
 # Azure Key Vault holding (a) the SQL password used by the OPDG source connection
 # and (b) the SP secret used by the ADLS target connection.
-# The SPN running step 3 needs 'Key Vault Secrets User' on this vault.
+# The Team SPN running step 4 needs 'Key Vault Secrets User' on this vault.
 key_vault:
   vault_url: https://<your-kv-name>.vault.azure.net
   sql_password_secret_name: <kv-secret-name-for-sql-password>
@@ -39,7 +62,7 @@ connections:
   target:
     # ADLS Gen2 target. Created as a ShareableCloud connection with
     # allowConnectionUsageInGateway=true so the OPDG can use it for the sink leg.
-    # Authenticated as the SPN; secret pulled from KV at step 3 runtime.
+    # Authenticated as the SPN; secret pulled from KV at step 4 runtime.
     name: <target-connection-display-name>
     adls_account: <adls-account-name>
     container: <container-name>
