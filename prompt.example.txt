@@ -42,8 +42,8 @@ Steps:
    2.2   Create the workspace (2.2a; bound to the capacity from 2.1) and grant on it:
          <team-workspace-contributor-secgrp-name> Contributor (2.2b) + Team SPN direct
          Contributor (2.2c; belt-and-braces for group propagation lag).
-   2.3   Grant <team-workspace-contributor-secgrp-name> ConnectionCreatorWithResharing
-         on OPDG (2.3a) + VDG (2.3b).
+   2.3   Grant <team-workspace-contributor-secgrp-name> ConnectionCreator (need-to-know;
+         not ConnectionCreatorWithResharing) on OPDG (2.3a) + VDG (2.3b).
   3.   Team SPN (runs 3.1 + 3.2 + 3.3):
    3.1   Create the SQL source connection (OPDG, 3.1a) + ShareableCloud ADLS Gen2
          target connection (3.1b).

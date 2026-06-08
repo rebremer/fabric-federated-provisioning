@@ -43,7 +43,7 @@ Single Python script that demos a **federated** Fabric provisioning flow with th
                             │ 2.1  ARM: PUT Microsoft.Fabric/capacities (F2) + self-assign Admin
                             │ 2.2  Fabric: create workspace (2.2a), grant team_secgrp + Team SPN
                             │             Contributor (2.2b + 2.2c)
-                            │ 2.3  Fabric: grant team_secgrp ConnectionCreatorWithResharing on
+                            │ 2.3  Fabric: grant team_secgrp ConnectionCreator on
                             │             OPDG (2.3a) + VDG (2.3b)
                             ▼                                     │
             ┌──────────────────────────────────────────────┐      │
@@ -95,7 +95,7 @@ Three identities, three handoffs, zero shared secrets. Each persona only has the
 | **2** | **Platform SPN** | Runs all of 2.1 + 2.2 + 2.3 in one command. |
 | 2.1 | Platform SPN — *Fabric capacity* | ARM-creates `Microsoft.Fabric/capacities/<name>` (default `F2`) in the RG provisioned by 1.2, and self-assigns capacity Admin (`administration.members`, a superset of Contributor). Idempotent: re-running PATCHes admins if the capacity already exists. |
 | 2.2 | Platform SPN — *workspace lifecycle* | Creates the workspace bound to the capacity (2.2a); grants `team_workspace_contributor_security_group` `Contributor` on it (2.2b); grants the team SPN directly `Contributor` on it (2.2c; no-op if `workspace.spn_object_id` is unset). |
-| 2.3 | Platform SPN — *gateway federation* | Grants `team_workspace_contributor_security_group` `ConnectionCreatorWithResharing` on OPDG (2.3a) + VDG (2.3b). Skip 2.3 for a workspace that doesn't need gateway access. |
+| 2.3 | Platform SPN — *gateway federation* | Grants `team_workspace_contributor_security_group` `ConnectionCreator` (need-to-know; not `ConnectionCreatorWithResharing`, so the Team SPN cannot reshare gateway access) on OPDG (2.3a) + VDG (2.3b). Skip 2.3 for a workspace that doesn't need gateway access. |
 | **3** | **Team SPN** | Runs all of 3.1 + 3.2 + 3.3 in one command. |
 | 3.1 | Team SPN — *connections* | Creates the SQL source connection on the OPDG (3.1a) and the ADLS target ShareableCloud connection (3.1b). |
 | 3.2 | Team SPN — *pipeline* | Creates / updates the copy pipeline. |

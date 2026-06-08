@@ -31,8 +31,8 @@ capacity:
 team_workspace_contributor_security_group:
   # *Team* security group: Entra ID object id of the group containing the team SPN.
   # Step 2.2 grants this group Contributor on the workspace; step 2.3 grants it
-  # ConnectionCreatorWithResharing on both gateways. The team SPN runs all step 3.x by
-  # virtue of being in this group.
+  # ConnectionCreator (need-to-know; not ConnectionCreatorWithResharing) on both gateways.
+  # The team SPN runs all step 3.x by virtue of being in this group.
   object_id: <team-security-group-object-id>
 
 platform_workspace_security_group:
@@ -48,9 +48,9 @@ platform_workspace_security_group:
 platform_gateway_security_group:
   # *Platform gateway-admin* security group. Step 1.3 (Fabric admin) grants this group
   # Admin on the OPDG and VDG so its members (e.g. the Platform SPN) can later
-  # delegate ConnectionCreatorWithResharing to team secgrps without involving the
-  # Fabric admin. (Docs say ConnectionCreatorWithResharing is enough to assign roles
-  # but in practice only Admin works — lower roles get 403 InsufficientPermissionsToManageGateway.)
+  # delegate ConnectionCreator to team secgrps without involving the Fabric admin.
+  # (Docs say ConnectionCreatorWithResharing is enough to assign roles but in practice
+  # only Admin works — lower roles get 403 InsufficientPermissionsToManageGateway.)
   # The Platform SPN must be a member of this group to run step 2.3.
   object_id: <platform-gateway-security-group-object-id>
 

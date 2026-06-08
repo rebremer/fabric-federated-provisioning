@@ -11,7 +11,7 @@ Three personas, three top-level commands (each composed of named sub-steps):
     #     platform_workspace_security_group Contributor on it (replaces the previous
     #     manual `az group create` + `az role assignment create` prereq).
     # 1.3 grant platform_gateway_security_group Admin on the OPDG (1.3a) and VDG (1.3b)
-    #     so members can later delegate ConnectionCreatorWithResharing to team groups.
+    #     so members can later delegate ConnectionCreator to team groups.
     az login
     python scripts/provision_fabric.py 1   config/prod-01.yaml    # 1.1 + 1.2 + 1.3
     python scripts/provision_fabric.py 1.2 config/prod-01.yaml    # or run a single sub-step
@@ -21,7 +21,7 @@ Three personas, three top-level commands (each composed of named sub-steps):
     #     capacity Admin (so 2.2 can bind the workspace without a portal step).
     # 2.2 create workspace (2.2a), grant team secgrp Contributor (2.2b), grant team SPN
     #     direct Contributor (2.2c; no-op if workspace.spn_object_id unset).
-    # 2.3 federate gateway access — grant team secgrp ConnectionCreatorWithResharing
+    # 2.3 federate gateway access — grant team secgrp ConnectionCreator
     #     on OPDG (2.3a) and VDG (2.3b).
     az logout
     az login --service-principal --username <platform-app-id> --tenant <tenant-id> --password <secret>
@@ -802,17 +802,18 @@ def step_2_2(client: FabricClient, cfg: dict[str, Any]) -> None:
 
 
 # --- Step 2.3: Platform SPN — gateway federation ----------------------
-# Grants the team security group ConnectionCreatorWithResharing on the OPDG and VDG
-# so the Team SPN can create connections in step 3.1 *and* reshare them with other
-# principals. The platform gateway-admin secgrp (Admin role from step 1.3) is allowed
-# to assign any role, including ConnectionCreatorWithResharing.
+# Grants the team security group ConnectionCreator on the OPDG and VDG so the Team SPN
+# can create connections in step 3.1. Need-to-know: ConnectionCreator (NOT
+# ConnectionCreatorWithResharing) — the Team SPN should not be able to reshare gateway
+# access with other principals. The platform gateway-admin secgrp (Admin role from
+# step 1.3) is allowed to assign any role, including ConnectionCreator.
 
 
 def step_2_3a(client: FabricClient, cfg: dict[str, Any]) -> None:
     _assign_gateway_role(
         client, cfg, "opdg", "2.3a",
         principal_id=cfg["team_workspace_contributor_security_group"]["object_id"],
-        role="ConnectionCreatorWithResharing",
+        role="ConnectionCreator",
     )
 
 
@@ -820,12 +821,12 @@ def step_2_3b(client: FabricClient, cfg: dict[str, Any]) -> None:
     _assign_gateway_role(
         client, cfg, "vdg", "2.3b",
         principal_id=cfg["team_workspace_contributor_security_group"]["object_id"],
-        role="ConnectionCreatorWithResharing",
+        role="ConnectionCreator",
     )
 
 
 def step_2_3(client: FabricClient, cfg: dict[str, Any]) -> None:
-    """Platform SPN: federate gateway access — team secgrp ConnectionCreatorWithResharing on OPDG + VDG."""
+    """Platform SPN: federate gateway access — team secgrp ConnectionCreator on OPDG + VDG."""
     step_2_3a(client, cfg)
     step_2_3b(client, cfg)
 
