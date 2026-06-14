@@ -5,6 +5,8 @@ config/*.yaml
 
 # Scratch / demo notes that often contain credentials.
 prompt.txt
+blog.txt
+blog_old.txt
 *.local.md
 .env
 .env.*
