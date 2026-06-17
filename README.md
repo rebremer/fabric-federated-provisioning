@@ -24,15 +24,15 @@ Three identities, three handoffs, zero shared secrets. Each persona only has the
 
 | # | Persona | Scope |
 |---|---|---|
-| **1** | **Fabric admin** (one-time bootstrap) | Runs all of 1.1 + 1.2 + 1.3 in one command. Can be a **human** Fabric admin (`az login`) *or* a dedicated **bootstrap SPN** holding the Entra **Fabric Administrator** directory role + Owner on the target subscription — the Fabric / ARM APIs called in step 1 accept either. The docs and CLI examples below default to the human path because step 1 is one-time per environment; promote it to an SPN if you run step 1 from CI/CD or across many landing zones. After step 1 the Fabric admin is no longer in the loop. |
+| **1** | **Fabric admin** (`1`, one-time bootstrap) | Runs all of 1.1 + 1.2 + 1.3 in one command. Can be a **human** Fabric admin (`az login`) *or* a dedicated **bootstrap SPN** holding the Entra **Fabric Administrator** directory role + Owner on the target subscription — the Fabric / ARM APIs called in step 1 accept either. The docs and CLI examples below default to the human path because step 1 is one-time per environment; promote it to an SPN if you run step 1 from CI/CD or across many landing zones. After step 1 the Fabric admin is no longer in the loop. |
 | 1.1 | Fabric admin — *tenant allow-list* | Adds `platform_workspace_security_group` to the tenant-setting allow-list for "Service principals can create workspaces, connections, and deployment pipelines" (Fabric tenant-settings Preview API, mandatory — setting names configured under `tenant_settings.enabled_setting_names` in YAML). |
 | 1.2 | Fabric admin — *Azure RG + Contributor* | Creates the Azure resource group named in `capacity.resource_group` and grants `platform_workspace_security_group` `Contributor` on it. Replaces the previous manual `az group create` + `az role assignment create` prereq. Requires Owner (or Contributor + User Access Administrator) on the subscription. |
 | 1.3 | Fabric admin — *gateway Admin* | Grants `platform_gateway_security_group` `Admin` on the OPDG (1.3a) + VDG (1.3b). Admin is required in practice; lower roles return 403 `InsufficientPermissionsToManageGateway` despite what the docs say. |
-| **2** | **Platform team** (runs as the **Platform SPN**) | Runs all of 2.1 + 2.2 + 2.3 in one command. |
+| **2** | **Platform team** (`M`, runs as the **Platform SPN**) | Runs all of 2.1 + 2.2 + 2.3 in one command. |
 | 2.1 | Platform team — *Fabric capacity* | ARM-creates `Microsoft.Fabric/capacities/<name>` (default `F2`) in the RG provisioned by 1.2, and self-assigns capacity Admin (`administration.members`, a superset of Contributor). Idempotent: re-running PATCHes admins if the capacity already exists. |
 | 2.2 | Platform team — *workspace lifecycle* | Creates the workspace bound to the capacity (2.2a); grants `team_workspace_contributor_security_group` `Contributor` on it (2.2b); grants the Team SPN directly `Contributor` on it (2.2c; no-op if `workspace.spn_object_id` is unset). |
 | 2.3 | Platform team — *gateway federation* | Grants `team_workspace_contributor_security_group` `ConnectionCreator` (need-to-know; not `ConnectionCreatorWithResharing`, so the Team SPN cannot reshare gateway access) on OPDG (2.3a) + VDG (2.3b). Skip 2.3 for a workspace that doesn't need gateway access. |
-| **3** | **Workspace team** (runs as the **Team SPN**) | Runs all of 3.1 + 3.2 + 3.3 in one command. |
+| **3** | **Workspace team** (`M×N`, runs as the **Team SPN**) | Runs all of 3.1 + 3.2 + 3.3 in one command. |
 | 3.1 | Workspace team — *connections* | Creates the SQL source connection on the OPDG (3.1a) and the ADLS target ShareableCloud connection (3.1b). |
 | 3.2 | Workspace team — *pipeline* | Creates / updates the copy pipeline. For real production workspace-item promotion (DEV→PPE→PROD across many pipelines, lakehouses, notebooks, semantic models, …), consider Microsoft's [fabric-cicd](https://microsoft.github.io/fabric-cicd/) library instead — it consumes git-synced item definitions and handles the full deploy. This script keeps 3.2 hand-rolled because the demo's value is in 3.1 (connections / OPDG encryption) and 3.3 (run + poll), which fabric-cicd does not cover. |
 | 3.3 | Workspace team — *run pipeline* | Triggers the pipeline run and polls to completion. |
@@ -50,20 +50,20 @@ The Workspace team's YAML references the workspace by display name (`workspace.n
 
 One tier per persona. Start with Tier&nbsp;1, add the next tier only when the next persona joins. OPDG / VDG and SQL / ADLS are **optional add-ons** inside the tier of the persona that uses them.
 
-### Tier 1 — Fabric admin (step 1)
+### Tier 1 — Fabric admin (`1`, step 1)
 
 - `platform_workspace_security_group` (Entra ID) containing the Platform SPN
 - Step-1 identity (human or bootstrap SPN): Entra **Fabric Administrator** role + **Owner** on the target subscription (or Contributor + User Access Administrator)
 
 *Optional — enable gateway federation (1.3):* add an OPDG + VDG and a `platform_gateway_security_group` containing the Platform SPN. Only needed if a downstream Tier&nbsp;2 platform team will run the integration variant.
 
-### Tier 2 — Platform team (step 2)
+### Tier 2 — Platform team (`M`, step 2)
 
 - `team_workspace_contributor_security_group` (Entra ID) containing the Team SPN
 
 *Optional — federate gateway access (2.3):* no new infra; only requires that Tier&nbsp;1's optional gateway add-on was run.
 
-### Tier 3 — Workspace team (step 3)
+### Tier 3 — Workspace team (`M×N`, step 3)
 
 For the SQL → ADLS Gen2 copy pipeline:
 
@@ -119,7 +119,7 @@ config/
 ## Run
 
 ```powershell
-# === Step 1 — Fabric admin (one-time bootstrap) ============================
+# === Step 1 — Fabric admin (1, one-time bootstrap) ==========================
 # 1.1 tenant allow-list, 1.2 RG create + Contributor, 1.3 gateway Admin on OPDG + VDG.
 # Discover the exact tenant setting name(s) for your tenant with:
 #   python scripts/admin/bootstrap.py tenant-settings config/admin/tenant.yaml
@@ -131,13 +131,13 @@ python scripts/admin/bootstrap.py 1   config/admin/tenant.yaml    # 1.1 + 1.2 + 
 # (or run a single sub-step, e.g. just create the RG + role:)
 # python scripts/admin/bootstrap.py 1.2 config/admin/tenant.yaml
 
-# === Step 2 — Integration Platform team (runs as the Platform SPN) =========
+# === Step 2 — Integration Platform team (M, runs as the Platform SPN) ======
 az logout
 az login --service-principal --username <platform-app-id> --tenant <tenant-id> --password <secret>
 python scripts/platform_team/integration.py 2 config/platform_team/integration/prod-01.yaml
 # 2.1 capacity + 2.2 workspace + 2.3 OPDG/VDG ConnectionCreator for team secgrp
 
-# === Step 3 — Integration Workspace team (runs as the Team SPN) ============
+# === Step 3 — Integration Workspace team (M×N, runs as the Team SPN) =======
 #     member of team_workspace_contributor_security_group
 az logout
 az login --service-principal --username <team-app-id> --tenant <tenant-id> --password <secret>
