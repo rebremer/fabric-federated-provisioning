@@ -1,6 +1,33 @@
 # Fabric federated workspace + OPDG demo
 
-Reference implementation of a **federated** Microsoft Fabric provisioning flow with three personas — named after the organizational role that owns each slice, not the identity type — and **three top-level steps** (each composed of named sub-steps). The **Fabric admin** (`1`, a human or an SPN holding the Entra **Fabric Administrator** directory role) runs a one-time bootstrap (tenant allow-list + Azure RG create + gateway Admin grants); the **Platform team** (`M`, running as a Platform SPN) ARM-creates the Fabric capacity, provisions a workspace, and federates gateway access to team security groups; the **Workspace team** (`M×N`, running as a Team SPN) owns one workspace end-to-end.
+Reference implementation of a **federated** Microsoft Fabric provisioning flow with three personas — named after the organizational role that owns each slice, not the identity type — and **three top-level steps** (each composed of named sub-steps). The **Fabric admin** (`1`, a human or an SPN holding the Entra **Fabric Administrator** directory role) runs a one-time bootstrap (tenant allow-list + Azure RG create + gateway Admin grants); the **Platform team** (`M`, running as a Platform SPN) ARM-creates the Fabric capacity, provisions a workspace, and federates gateway access to team security groups; the **Workspace team** (`M×N`, running as a Team SPN) owns one workspace end-to-end. Three identities, three handoffs, zero shared secrets — each persona only has the Azure / Fabric / data permissions needed for its own slice, and the script enforces this with `require_identity` at every step boundary.
+
+## Quickstart
+
+Six steps from a clean clone to a running pipeline. Each "run" line is a single command — full CLI variants, sub-steps, and helpers are in [Run](#run) below.
+
+1. **Check prerequisites** — security groups + SPNs + Azure roles per persona ([Prerequisites](#prerequisites-exist-before-running-the-script)).
+2. **Install** — Python 3.10+ in a venv ([Setup](#setup)):
+   ```powershell
+   python -m venv .venv; .\.venv\Scripts\Activate.ps1; pip install -r requirements.txt
+   ```
+3. **Configure** — copy the three example YAMLs and fill in your IDs ([Configure](#configure)).
+4. **Run as Fabric admin (`1`)** — one-time per tenant; `az login` as a human admin or a bootstrap SPN:
+   ```powershell
+   python scripts/admin/bootstrap.py 1 config/admin/tenant.yaml
+   ```
+5. **Run as Platform SPN (`M`)** — once per workspace; `az login --service-principal` as the Platform SPN:
+   ```powershell
+   python scripts/platform_team/integration.py 2 config/platform_team/integration/prod-01.yaml
+   ```
+6. **Run as Team SPN (`M×N`)** — once per workspace; `az login --service-principal` as the Team SPN:
+   ```powershell
+   python scripts/workspace_team/integration.py 3 config/workspace_team/integration/prod-01.yaml
+   ```
+
+After step 4 the Fabric admin is out of the loop — onboarding additional workspaces is just steps 5 + 6 against new YAML files (`prod-02.yaml`, …). Every script is idempotent: re-running reconciles drift from the YAML.
+
+## Repo layout
 
 Each persona has its own entrypoint script and its own YAML config, so no persona reads or runs code outside its slice:
 
@@ -10,15 +37,12 @@ Each persona has its own entrypoint script and its own YAML config, so no person
 | Platform team (`M`) — integration | [scripts/platform_team/integration.py](scripts/platform_team/integration.py) | [config/platform_team/integration/prod-01.example.yaml](config/platform_team/integration/prod-01.example.yaml) |
 | Workspace team (`M×N`) — integration | [scripts/workspace_team/integration.py](scripts/workspace_team/integration.py) | [config/workspace_team/integration/prod-01.example.yaml](config/workspace_team/integration/prod-01.example.yaml) |
 
+The diagram below shows how the three personas hand off responsibility — Fabric admin grants platform security groups, the Platform team grants the workspace team, the Workspace team owns its workspace:
+
+![Fabric admin (1) =>  Platform team (M) =>  Workspace team (M×N) architecture](architecture/architecture.png)
+
 This repo implements the **integration variant** (Platform team that federates OPDG/VDG access; Workspace team that builds an SQL → ADLS Gen2 copy pipeline). The same persona pattern applies to other variants (e.g. a PBI platform team that provisions semantic-model workspaces without OPDG); [scripts/platform_team/pbi.py](scripts/platform_team/pbi.py) and [scripts/workspace_team/pbi.py](scripts/workspace_team/pbi.py) are stubs with docstrings outlining what such a variant would do.
 
-## Architecture
-
-### 1.1 Fabric admin (1) => Platform team (M) => Workspace team (MxN) architecture
-
-![Fabric admin (1) => Platform team (M) => Workspace team (MxN) architecture](architecture/architecture.png)
-
-Three identities, three handoffs, zero shared secrets. Each persona only has the Azure / Fabric / data permissions needed for its own slice; the script enforces this with `require_identity` at every step boundary.
 
 ## Personas
 
@@ -37,14 +61,7 @@ Three identities, three handoffs, zero shared secrets. Each persona only has the
 | 3.2 | Workspace team — *pipeline* | Creates / updates the copy pipeline. For real production workspace-item promotion (DEV→PPE→PROD across many pipelines, lakehouses, notebooks, semantic models, …), consider Microsoft's [fabric-cicd](https://microsoft.github.io/fabric-cicd/) library instead — it consumes git-synced item definitions and handles the full deploy. This script keeps 3.2 hand-rolled because the demo's value is in 3.1 (connections / OPDG encryption) and 3.3 (run + poll), which fabric-cicd does not cover. |
 | 3.3 | Workspace team — *run pipeline* | Triggers the pipeline run and polls to completion. |
 
-After step 1, onboarding a new team workspace is two commands against new per-persona YAML files:
-
-```powershell
-python scripts/platform_team/integration.py  2 config/platform_team/integration/prod-02.yaml   # as Platform SPN
-python scripts/workspace_team/integration.py 3 config/workspace_team/integration/prod-02.yaml  # as Team SPN
-```
-
-The Workspace team's YAML references the workspace by display name (`workspace.name`) — every script rediscovers Fabric ids (capacity, workspace) by name at runtime, so the two YAMLs don't have to share any generated state.
+The Workspace team's YAML references the workspace by display name (`workspace.name`) — every script rediscovers Fabric ids (capacity, workspace) by name at runtime, so the two YAMLs don't have to share any generated state. Onboarding a new workspace is just steps 5 + 6 of the [Quickstart](#quickstart) against new YAML files (e.g. `prod-02.yaml`).
 
 ## Prerequisites (exist before running the script)
 
