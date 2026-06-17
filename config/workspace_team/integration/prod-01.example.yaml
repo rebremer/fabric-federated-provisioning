@@ -1,0 +1,69 @@
+# Per-environment config for scripts/workspace_team/integration.py.
+# Copy this file to config/workspace_team/integration/<env>.yaml and edit values.
+#
+# Owned by: the integration Workspace team (runs as the Team SPN).
+# Read by:  scripts/workspace_team/integration.py
+#
+# Carries everything step 3.x needs:
+#   - workspace.name (reference — must match platform_team/integration/<env>.yaml)
+#   - team_workspace_contributor_security_group (for connection ownership grants)
+#   - key_vault.* (where SQL password + SPN secret live)
+#   - gateways.opdg / .vdg (display names only — the team can't admin the gateways)
+#   - connections.source (OPDG SQL) and connections.target (ShareableCloud ADLS)
+#   - pipeline.* (the actual copy pipeline definition)
+#
+# Secrets never live here — only the Key Vault URL + secret names.
+
+workspace:
+  # Reference to the workspace created by platform_team/integration.py step 2.2a.
+  # Looked up by display name via GET /v1/workspaces.
+  name: <workspace-display-name>
+
+team_workspace_contributor_security_group:
+  # Used to grant the team secgrp Owner on each new connection (step 3.1).
+  object_id: <team-security-group-object-id>
+
+# Azure Key Vault holding (a) the SQL password used by the OPDG source connection
+# and (b) the SP secret used by the ADLS target connection.
+# The Team SPN running this script needs 'Key Vault Secrets User' on this vault.
+key_vault:
+  vault_url: https://<your-kv-name>.vault.azure.net
+  sql_password_secret_name: <kv-secret-name-for-sql-password>
+
+gateways:
+  # Display names only — the workspace team is ConnectionCreator (not admin) on these,
+  # and resolves names via GET /v1/gateways.
+  opdg: <opdg-display-name>
+  vdg:  <vdg-display-name>
+  # opdg_id: <opdg-guid>
+  # vdg_id:  <vdg-guid>
+
+connections:
+  source:
+    # Azure SQL Database reached through the OPDG (mimics on-prem / Oracle source).
+    name: <source-connection-display-name>
+    server:   <sql-server>.database.windows.net
+    database: <database-name>
+    credential:
+      type: Basic                              # SQL auth: username here, password from KV
+      username: <sql-username>
+  target:
+    # ADLS Gen2 target. Created as a ShareableCloud connection with
+    # allowConnectionUsageInGateway=true so the OPDG can use it for the sink leg.
+    name: <target-connection-display-name>
+    adls_account: <adls-account-name>
+    container: <container-name>
+    credential:
+      type: ServicePrincipal
+      tenant_id: <entra-tenant-guid>
+      client_id: <spn-app-id-guid>
+      secret_name: <kv-secret-name-for-spn-secret>
+
+pipeline:
+  name: <pipeline-display-name>
+  # Query executed against the SQL source.
+  source_query: SELECT * FROM SalesLT.Customer
+  # Sub-folder within the target container (blank = container root) + output file name.
+  # ADLS Gen2 sink requires a non-empty folder path (container root is rejected).
+  target_path: <folder>/<subfolder>
+  target_file_name: <output-file>.parquet

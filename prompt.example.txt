@@ -1,15 +1,22 @@
-Demo flow for scripts/provision_fabric.py — three federated personas, three top-level steps.
+Demo flow for the three persona scripts — three federated personas, three top-level steps.
 
 Personas:
   - Fabric admin: tenant admin, manages OPDG + VDG + tenant settings, and (new) creates
     the Azure resource group for the Fabric capacity and grants the Platform SPN's
     workspace-creator security group Contributor on it. One-time bootstrap only.
-  - Platform SPN: member of both <platform-workspace-secgrp-name> and
-    <platform-gateway-secgrp-name>. Creates the Fabric capacity (via ARM, in the RG
-    provisioned by step 1.2), workspaces, and federates access to team security groups.
-    Never touches source/target data.
-  - Team SPN: member of <team-workspace-contributor-secgrp-name>. Creates connections,
-    pipelines, and runs them inside its assigned workspace.
+    Owns config/admin/tenant.yaml.
+  - Platform SPN (integration variant): member of both <platform-workspace-secgrp-name>
+    and <platform-gateway-secgrp-name>. Creates the Fabric capacity (via ARM, in the RG
+    provisioned by step 1.2), workspaces, and federates OPDG/VDG access to team
+    security groups. Never touches source/target data. Owns
+    config/platform_team/integration/<env>.yaml.
+  - Team SPN (integration variant): member of <team-workspace-contributor-secgrp-name>.
+    Creates connections, pipelines, and runs them inside its assigned workspace. Owns
+    config/workspace_team/integration/<env>.yaml.
+
+Each YAML stands on its own — every script rediscovers Fabric ids (capacity, workspace) by
+name at runtime via GET /v1/capacities and GET /v1/workspaces, so there is no shared state
+file and no `env:` key tying the three personas together.
 
 Prerequisites (out-of-band, before running the script):
   - Fabric admin running step 1 has, on the Azure subscription named in
@@ -35,41 +42,50 @@ Steps:
          Contributor on it. Replaces the previous manual `az group create` +
          `az role assignment create` prereq.
    1.3   Grant <platform-gateway-secgrp-name> Admin on the OPDG (1.3a) + VDG (1.3b).
-  2.   Platform SPN (runs 2.1 + 2.2 + 2.3):
+         Auto-skipped for variants that omit the `gateways:` section (e.g. PBI).
+  2.   Platform SPN — integration variant (runs 2.1 + 2.2 + 2.3):
    2.1   ARM-create a Microsoft.Fabric/capacities F2 capacity in the RG from step 1.2
-         and self-assign capacity Admin. Persists the Fabric capacity GUID to
-         <cfg>.state.yaml.
+         and self-assign capacity Admin.
    2.2   Create the workspace (2.2a; bound to the capacity from 2.1) and grant on it:
          <team-workspace-contributor-secgrp-name> Contributor (2.2b) + Team SPN direct
          Contributor (2.2c; belt-and-braces for group propagation lag).
    2.3   Grant <team-workspace-contributor-secgrp-name> ConnectionCreator (need-to-know;
-         not ConnectionCreatorWithResharing) on OPDG (2.3a) + VDG (2.3b).
-  3.   Team SPN (runs 3.1 + 3.2 + 3.3):
+         not ConnectionCreatorWithResharing) on OPDG (2.3a) + VDG (2.3b). Integration-only.
+  3.   Team SPN — integration variant (runs 3.1 + 3.2 + 3.3):
    3.1   Create the SQL source connection (OPDG, 3.1a) + ShareableCloud ADLS Gen2
          target connection (3.1b).
    3.2   Create / update the Fabric copy pipeline (SQL -> ADLS Gen2 Parquet).
    3.3   Trigger pipeline run and poll until completion.
 
 
-# --- Step 1: Fabric admin - one-time bootstrap for new platform secgrp (int, pbi, ...) ---
+# --- Step 1: Fabric admin — one-time bootstrap for new platform secgrp (int, pbi, ...) ---
 az logout
 az login
-python scripts/provision_fabric.py 1.1 config/prod-01.yaml    # Admin add platform secgrp to tenant allow-list
-python scripts/provision_fabric.py 1.2 config/prod-01.yaml    # Admin create RG + grant Contributor to <platform_ws_secgrp>
-python scripts/provision_fabric.py 1.3 config/prod-01.yaml    # Admin grant Admin on OPDG + VDG to <platform_opdg_secgrp>
+python scripts/admin/bootstrap.py 1.1 config/admin/tenant.yaml    # Admin add platform secgrp to tenant allow-list
+python scripts/admin/bootstrap.py 1.2 config/admin/tenant.yaml    # Admin create RG + grant Contributor to <platform_ws_secgrp>
+python scripts/admin/bootstrap.py 1.3 config/admin/tenant.yaml    # Admin grant Admin on OPDG + VDG to <platform_gw_secgrp>
+# (run all at once with: python scripts/admin/bootstrap.py 1 config/admin/tenant.yaml)
 
-# --- Step 2: Platform SPN (member of <platform_ws_secgrp> and <platform_opdg_secgrp>) ---
+# --- Step 2: Integration Platform SPN (member of <platform_ws_secgrp> and <platform_gw_secgrp>) ---
 az logout
 # NEVER paste the real secret here. Use $env:PLATFORM_SPN_SECRET, Get-Secret, or paste at the prompt only.
 az login --service-principal --username <PLATFORM_SPN_APP_ID> --tenant <TENANT_ID> --password <PLATFORM_SPN_SECRET> --allow-no-subscriptions
-python scripts/provision_fabric.py 2.1 config/prod-01.yaml    # Platform ws secgrp spn creates Fabric capacity
-python scripts/provision_fabric.py 2.2 config/prod-01.yaml    # Platform ws secgrp spn creates workspace + grant Contributor to team secgrp
-python scripts/provision_fabric.py 2.3 config/prod-01.yaml    # Platform opdg secgrp spn grants ConnectionCreator on OPDG + VDG to team secgrp
+python scripts/platform_team/integration.py 2.1 config/platform_team/integration/prod-01.yaml    # Platform ws secgrp spn creates Fabric capacity
+python scripts/platform_team/integration.py 2.2 config/platform_team/integration/prod-01.yaml    # Platform ws secgrp spn creates workspace + grant Contributor to team secgrp
+python scripts/platform_team/integration.py 2.3 config/platform_team/integration/prod-01.yaml    # Platform gw  secgrp spn grants ConnectionCreator on OPDG + VDG to team secgrp
+# (run all at once with: python scripts/platform_team/integration.py 2 config/platform_team/integration/prod-01.yaml)
 
-# --- Step 3: Team SPN (member of <team_ws_secgrp>) ---
+# --- Step 3: Integration Team SPN (member of <team_ws_secgrp>) ---
 az logout
 # NEVER paste the real secret here. Use $env:TEAM_SPN_SECRET, Get-Secret, or paste at the prompt only.
 az login --service-principal --username <TEAM_SPN_APP_ID> --tenant <TENANT_ID> --password <TEAM_SPN_SECRET> --allow-no-subscriptions
-python scripts/provision_fabric.py 3.1 config/prod-01.yaml    # team secgrp spn creates SQL + ADLS connections
-python scripts/provision_fabric.py 3.2 config/prod-01.yaml    # team secgrp spn creates or update copy pipeline
-python scripts/provision_fabric.py 3.3 config/prod-01.yaml    # team secgrp spn run pipeline and poll
+python scripts/workspace_team/integration.py 3.1 config/workspace_team/integration/prod-01.yaml    # team secgrp spn creates SQL + ADLS connections
+python scripts/workspace_team/integration.py 3.2 config/workspace_team/integration/prod-01.yaml    # team secgrp spn creates or update copy pipeline
+python scripts/workspace_team/integration.py 3.3 config/workspace_team/integration/prod-01.yaml    # team secgrp spn run pipeline and poll
+# (run all at once with: python scripts/workspace_team/integration.py 3 config/workspace_team/integration/prod-01.yaml)
+
+# --- Helpers ---
+# Discover tenant setting names (Fabric admin, needed once for tenant_settings.enabled_setting_names):
+python scripts/admin/bootstrap.py tenant-settings config/admin/tenant.yaml
+# Status of one integration workspace (Team SPN identity is fine):
+python scripts/workspace_team/integration.py status config/workspace_team/integration/prod-01.yaml

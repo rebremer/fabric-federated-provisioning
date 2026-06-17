@@ -1,0 +1,57 @@
+# Per-environment config for scripts/platform_team/integration.py.
+# Copy this file to config/platform_team/integration/<env>.yaml and edit values.
+#
+# Owned by: the integration Platform team (runs as the Integration Platform SPN).
+# Read by:  scripts/platform_team/integration.py
+#
+# Carries everything step 2.x needs:
+#   - capacity.* (full ARM coordinates + name + sku)  for 2.1
+#   - workspace.name (+ optional spn_object_id)       for 2.2
+#   - team_workspace_contributor_security_group       for 2.2 + 2.3
+#   - gateways.opdg / .vdg                            for 2.3
+#   - platform_workspace_security_group + platform_gateway_security_group
+#     (just the object ids, so the script can sanity-check membership semantics
+#     and for status display; the actual grants on them happened in admin step 1)
+
+workspace:
+  name: <workspace-display-name>
+  # Optional: SPN *object id* (not app id) to assign directly as Contributor in step 2.2c.
+  # Belt-and-braces alongside the group assignment in 2.2b — guarantees the SPN sees the
+  # workspace even when AAD group propagation to Fabric is slow or unreliable.
+  # spn_object_id: <spn-object-id>
+
+capacity:
+  # ARM coordinates for the Fabric capacity created by step 2.1 (Platform SPN).
+  # subscription_id / resource_group / location must match the values in
+  # config/admin/tenant.yaml — admin step 1.2 created the RG and granted Contributor.
+  # Step 2.1 self-assigns capacity Admin via properties.administration.members.
+  # Capacity name constraints: ^[a-z][a-z0-9]*$, 3-63 chars, globally unique across all tenants.
+  subscription_id: <azure-subscription-guid>
+  resource_group: <azure-resource-group-name>
+  name: <capacity-name>            # e.g. fabriccapprod01
+  location: <azure-region>         # e.g. westeurope, westus3
+  sku: F2                          # F2-F2048; F2 ≈ $263/mo always-on
+
+team_workspace_contributor_security_group:
+  # *Team* security group containing the integration Team SPN.
+  # Step 2.2 grants this group Contributor on the workspace; step 2.3 grants it
+  # ConnectionCreator (need-to-know; NOT ConnectionCreatorWithResharing) on both gateways.
+  object_id: <team-security-group-object-id>
+
+platform_workspace_security_group:
+  # Repeated here for status display + sanity. Admin step 1.1 + 1.2 already granted this
+  # group its rights; this script doesn't grant anything to it.
+  object_id: <platform-workspace-security-group-object-id>
+
+platform_gateway_security_group:
+  # Repeated here for status display + sanity. Admin step 1.3 already granted this group
+  # Admin on the OPDG / VDG; this script doesn't grant anything to it.
+  object_id: <platform-gateway-security-group-object-id>
+
+gateways:
+  # Used by step 2.3 to find the OPDG + VDG to grant the team secgrp ConnectionCreator on.
+  # Display names (preferred) are resolved via GET /v1/gateways at runtime.
+  opdg: <opdg-display-name>
+  vdg:  <vdg-display-name>
+  # opdg_id: <opdg-guid>
+  # vdg_id:  <vdg-guid>

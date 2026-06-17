@@ -1,7 +1,7 @@
 # --- Secrets / environment-specific config (NEVER commit) ---
 # Real configs live next to *.example.yaml templates. Only the templates are tracked.
-config/*.yaml
-!config/*.example.yaml
+config/**/*.yaml
+!config/**/*.example.yaml
 
 # Scratch / demo notes that often contain credentials.
 prompt.txt
