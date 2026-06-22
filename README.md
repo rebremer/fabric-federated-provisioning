@@ -1,6 +1,9 @@
 # Fabric federated workspace + OPDG demo
 
-Reference implementation of a **federated** Microsoft Fabric provisioning flow with three personas — named after the organizational role that owns each slice, not the identity type — and **three top-level steps** (each composed of named sub-steps). The **Fabric admin** (`1`, a human or an SPN holding the Entra **Fabric Administrator** directory role) runs a one-time bootstrap (tenant allow-list + Azure RG create + gateway Admin grants); the **Platform team** (`M`, running as a Platform SPN) ARM-creates the Fabric capacity, provisions a workspace, and federates gateway access to team security groups; the **Workspace team** (`M×N`, running as a Team SPN) owns one workspace end-to-end. Three identities, three handoffs, zero shared secrets — each persona only has the Azure / Fabric / data permissions needed for its own slice, and the script enforces this with `require_identity` at every step boundary.
+
+Reference implementation of a **federated** Microsoft Fabric provisioning flow with three personas and three top-level steps: the **Fabric admin** (`1`) runs a one-time bootstrap; the **Platform team** (`M`, Platform SPN) creates the capacity, workspace, and federates gateway access; the **Workspace team** (`M×N`, Team SPN) owns one workspace end-to-end. Three identities, three handoffs, zero shared secrets — `require_identity` enforces the persona boundary at every step.
+
+> Full write-up: see the Medium article [*Microsoft Fabric Operating Model for Multiple Teams*](https://rebremer.medium.com/a-practical-multi-team-operating-model-for-microsoft-fabric-2efc6cb0a8d3) for the end-to-end design rationale and walkthrough that this repo implements.
 
 ## Quickstart
 
